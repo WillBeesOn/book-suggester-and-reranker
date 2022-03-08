@@ -1,9 +1,7 @@
 import re
 import math
-import tensorflow as tf
 import pandas as pd
 import numpy as np
-from scipy.spatial.distance import mahalanobis
 
 
 # Replace NaN values with a default value appropriate for the data type
@@ -15,36 +13,6 @@ def fill_nan(data):
         if dtype == 'object':
             data[key] = data[key].replace({'': default})
     return data
-
-
-# Process data into Tensorflow Datasets and batch/cache data
-def process_diamond_data(data, train_percent=0.8):
-    data_len = data.shape[0]
-
-    # Convert data into a Tensorflow Dataset. Later used to make train and test data
-    data_ds = tf.data.Dataset.from_tensor_slices(dict(data))
-
-    # Convert again, but to a constant Tensor, so it can be passed to the model to make a prediction after training.
-    # Do this because there's some wackiness with how the Tensor shape is when converting it above.
-    data_ds_to_predict = tf.data.Dataset.from_tensors({key: tf.constant(value) for key, value in data.items()})
-
-    # Randomly shuffle the data.
-    tf.random.set_seed(42)
-    shuffled = data_ds.shuffle(data_len, seed=42, reshuffle_each_iteration=False)
-
-    # Get number of data to train on and test on
-    train_num = math.floor(data_len * train_percent)
-    test_num = math.floor(data_len * (1 - train_percent))
-
-    # Take number of data to train/test with shuffled data.
-    train = data_ds.take(train_num)
-    test = data_ds.skip(train_num).take(test_num)
-
-    # Batch and cache data sets
-    bc_train = train.batch(math.floor(train_num), drop_remainder=True).cache()
-    bc_test = test.batch(math.floor(test_num / 10), drop_remainder=True).cache()
-
-    return bc_train, bc_test, data_ds_to_predict
 
 
 def preprocess_book_test_data():
@@ -183,25 +151,237 @@ def preprocess_all_data():
     )
 
 
-def mahalanobis_distance():
-    data = pd.read_csv('diamonds.csv').iloc[:, [0, 4, 5, 6, 7, 8, 9]]
-    subset = data.head(1000)
-    mean = np.mean(data)
-    inv_cov_data = np.linalg.inv(np.cov(data.values.T))
-    inv_cov_subset = np.linalg.inv(np.cov(subset.values.T))
-    m = [[mahalanobis(row, subset.iloc[j], inv_cov_subset) for j in range(i + 1, subset.shape[0])]
-         for i, row in subset.iterrows()]
-    print(data.head())
+def calc_euclid_dist(x, y):
+    return math.sqrt(sum([(x_val - y_val) ** 2 for x_val, y_val in zip(x, y)]))
 
 
-# Used to one-hot encode string features in data.
-def oh_encode(data):
-    to_oh_encode = [feat for feat in data.select_dtypes(['object'])]  # One hot encode string values
-    encodings = [pd.get_dummies(data[feat], prefix=feat) for feat in to_oh_encode]  # Get encodings from Pandas
+def map_ranking(ranking):
+    return [{
+        'title': r[0],
+        'gender': r[1],
+        'rank': i + 1,
+        'score': r[2],
+    } for i, r in enumerate(ranking)]
 
-    data = data.drop(to_oh_encode, 1)  # Drop the features that are now one hot encoded
 
-    # Reintroduce the encoded values
-    for e in encodings:
-        data = data.join(e)
-    return data
+def calc_metrics_and_zscore(mapped_ranking, original_data, sample=False):
+    metrics = []
+    r2_start = 1
+    for r in mapped_ranking:
+        for i in range(r2_start, len(mapped_ranking)):
+            r2 = mapped_ranking[i]
+            r_full = original_data[original_data['title'] == r['title']].copy()
+            r2_full = original_data[original_data['title'] == r2['title']].copy()
+
+            r_title = r_full.pop('title').values[0]
+            r2_title = r2_full.pop('title').values[0]
+
+            r_gender = r_full.pop('author_gender').values[0]
+            r2_gender = r2_full.pop('author_gender').values[0]
+
+            r_birthplace = r_full.pop('birthplace').values[0]
+            r2_birthplace = r2_full.pop('birthplace').values[0]
+
+            # If genders or birthplace are different, then assign one individual a value so the
+            # difference can be counted. What is a good value to encode the difference in gender and birthplace?
+            if r_gender != r2_gender:
+                r_full['author_gender'] = 1
+                r2_full['author_gender'] = 0
+            else:
+                r_full['author_gender'] = 0
+                r2_full['author_gender'] = 0
+            if r_birthplace != r2_birthplace:
+                r_full['birthplace'] = 1
+                r2_full['birthplace'] = 0
+            else:
+                r_full['birthplace'] = 0
+                r2_full['birthplace'] = 0
+
+            individual_dist = calc_euclid_dist(
+                r_full.values.flatten().tolist(),
+                r2_full.values.flatten().tolist()
+            )
+
+            # eval_dist = abs(r['rank'] - r2['rank'])
+            eval_dist = calc_euclid_dist([r['rank']], [r2['rank']])
+
+            metrics.append({
+                'book1': {
+                    'title': r_title,
+                    'gender': r_gender,
+                    'birthplace': r_birthplace
+                },
+                'book2': {
+                    'title': r2_title,
+                    'gender': r2_gender,
+                    'birthplace': r2_birthplace
+                },
+                'individual_dist': individual_dist,
+                'eval_dist': eval_dist
+            })
+        r2_start += 1
+
+    # Calc mean and standard deviation for individual and eval metrics for normalization
+    metrics_len = len(metrics)
+    all_indiv_metrics = [m['individual_dist'] for m in metrics]
+    all_eval_metrics = [m['eval_dist'] for m in metrics]
+
+    indiv_mean = sum(all_indiv_metrics) / metrics_len
+    eval_mean = sum(all_eval_metrics) / metrics_len
+
+    n = metrics_len - 1 if sample else metrics_len
+    indiv_std_dev = math.sqrt(sum([(v - indiv_mean) ** 2 for v in all_indiv_metrics]) / n)
+    indiv_std_dev = indiv_std_dev if indiv_std_dev != 0 else 1
+    eval_std_dev = math.sqrt(sum([(v - eval_mean) ** 2 for v in all_eval_metrics]) / n)
+    eval_std_dev = eval_std_dev if eval_std_dev != 0 else 1
+
+    # z score all and take absolute value since for individual fairness we're really supposed to be comparing distance
+    # Individual z score represents how "different" 2 individuals are compared to all other pairs of individuals
+    # Eval z score represents how "differently" the individual was ranked compared to other individuals
+    satisfy_indiv_fairness = 0
+    for m in metrics:
+        m['z_indiv_dist'] = abs((m['individual_dist'] - indiv_mean) / indiv_std_dev)
+        m['z_eval_dist'] = abs((m['eval_dist'] - eval_mean) / eval_std_dev)
+
+        satisfy_indiv_fairness += 1 if m['z_eval_dist'] <= m['z_indiv_dist'] else 0
+
+    return metrics, satisfy_indiv_fairness / metrics_len
+
+
+def calc_sensitive_attr_ratio(data, original_data):
+    genders_in_data = ['male', 'female']
+    data_len = len(data)
+    merged = pd.merge(pd.DataFrame(data), original_data, on='title')
+
+    gender_num = merged['author_gender'].value_counts()
+    birthplace_num = merged['birthplace'].value_counts()
+
+    gender_dict = {g: gender_num[g] / data_len if g in gender_num else 0 for g in genders_in_data}
+    birthplace_dict = {b: birthplace_num[b] / data_len for b in birthplace_num.keys()}
+    return {
+        **gender_dict,
+        'birthplace': {
+            **birthplace_dict
+        }
+    }
+
+
+def rerank(top_dict, original_data):
+    merged = pd.merge(pd.DataFrame(top_dict['ranking']), original_data, on='title')
+    genders_in_data = ['male', 'female']
+
+    #         Male  Female
+    a_upper = [0.9, 0.9]  # Upper bound for range in which fairness should be
+    b_lower = [0.3, 0.65]  # Lower bound for range in which fairness should be
+    l_groups = 2
+    a_min = max(a_upper)
+    a_max = min(a_upper)
+    l_star = b_lower.index(min(b_lower))
+    N = len(top_dict['ranking'])
+    k = N
+
+    e = (2 / k) * max([
+        1 + (l_groups / sum([a_upper[L] - b_lower[L] for L in range(l_groups)])),
+        1 + (l_groups / (1 - sum(b_lower))),
+        max([1 + (2 / (a_upper[L] - b_lower[L])) for L in range(l_groups)])
+    ])
+    B = math.floor(e * k / 2)
+    b = min([
+        math.floor(a_min * B),
+        B - sum([math.ceil(b_lower[L] * B) if L != l_star else 0 for L in range(l_groups)])
+    ])
+    M = math.ceil(N / b) * B
+
+    def recurse_edit(data, new_index, old_index):
+        if data[new_index] is not None:
+            recurse_edit(data, new_index + 1, new_index)
+        data[new_index] = data[old_index]
+        data[old_index] = None
+
+    new_rank = [top_dict['ranking'][i] if i < 30 else None for i in range(1000)]
+
+    for i in range(math.ceil(N / b), -1, -1):
+        for j in range(1, min(b, N - (i - 1))):
+            old = b * (i - 1) + j
+            new = (i - 1) * B + j
+            # print(f'Move item at {old} to {new}')
+            recurse_edit(new_rank, new, old)
+
+    for j in range(M):
+        if new_rank[j] is None:
+            i = math.ceil(j / B)
+            for j2 in range(j + 1, M):
+                if new_rank[j2] is not None:
+                    group = genders_in_data.index(
+                        merged[merged['title'] == new_rank[j2]['title']]['author_gender'].values[0]
+                    )
+
+                    # For group, check if the lower bound is satisfied by the fairness result for the ith block
+                    #  a block contains the items at the ranks [(i - 1) * k + 1, (i - 1) * k + 2, ..., (i - 1) * k + k]
+                    # OR
+                    # Check if lower bound for all groups satisfied (for all groups, fairness is above lower bound)
+                    #  AND
+                    # Check if upper bound for group wouldn't be violated ()
+                    # Then move item at rank j2 to rank j, then break
+                    satis = top_dict['satisfaction_rate']
+
+                    if satis < b_lower[group] or (b_lower[0] < satis < a_upper[group] and b_lower[1] < satis):
+                        recurse_edit(new_rank, j, j2)
+                        break
+
+    for j in range(N):
+        if new_rank[j] is None:
+            for i in range(j - 1, -1, -1):
+                if new_rank[i] is not None:
+                    new_rank[j] = new_rank[i]
+                    new_rank[i] = None
+                    break
+
+    new_rank = list(filter(lambda x: x is not None, new_rank))
+    out_of_order_ranks = [r['rank'] for r in new_rank]
+    out_of_order_scores = [r['score'] for r in new_rank]
+    out_of_order_ranks.sort()
+    out_of_order_scores.sort()
+    ordered_ranks = out_of_order_ranks
+    ordered_scores = list(reversed(out_of_order_scores))
+    return [{
+        'title': out_of_order['title'],
+        'gender': out_of_order['gender'],
+        'rank': ordered_r,
+        'score': ordered_s
+    } for out_of_order, ordered_r, ordered_s in zip(new_rank, ordered_ranks, ordered_scores)]
+
+
+def calc_individual_fairness_metrics_and_accuracy(prediction, original_data, top_only=False, top=10):
+    top_ranked = map_ranking(prediction[:top])
+
+    top_metrics, top_satisfy_rate = calc_metrics_and_zscore(top_ranked, original_data, sample=True)
+    top_dict = {
+        'ranking': top_ranked,
+        'metrics': top_metrics,
+        'satisfaction_rate': top_satisfy_rate,
+        **calc_sensitive_attr_ratio(top_ranked, original_data)
+    }
+
+    new_rank = rerank(top_dict, original_data)
+    new_top_metrics, new_top_satisfy_rate = calc_metrics_and_zscore(new_rank, original_data, sample=True)
+    new_top_dict = {
+        **{f'old_{k}': top_dict[k] for k in top_dict.keys()},
+        **calc_sensitive_attr_ratio(top_ranked, original_data),
+        'new_ranking': new_rank,
+        'new_metrics': new_top_metrics,
+        'new_satisfaction_rate': new_top_satisfy_rate,
+        'improved': new_top_satisfy_rate > top_satisfy_rate
+    }
+
+    if top_only:
+        return new_top_dict
+
+    # all_metrics, all_satisfy_rate = calc_metrics_and_zscore(mapped_ranking, original_data)
+    #
+    # return {
+    #     'ranking': mapped_ranking,
+    #     'metrics': all_metrics,
+    #     'satisfaction_rate': all_satisfy_rate,
+    #     **calc_sensitive_attr_ratio(mapped_ranking, original_data)
+    # }, top_dict

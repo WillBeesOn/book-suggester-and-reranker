@@ -1,394 +1,246 @@
 import math
-import time
-import re
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-from ciso8601 import parse_datetime
-from utils import process_diamond_data, fill_nan, oh_encode, preprocess_all_data
-from RankingModel import RankingModel
-
-from typing import Dict, Tuple
-import tensorflow_datasets as tfds
-import tensorflow_ranking as tfr
-
-
-def tf_recommend():
-    # diamonds = pd.read_csv('diamonds.csv')
-    # train, test, predict = process_diamond_data(diamonds)
-    #
-    # model = RankingModel(diamonds, 'price')
-    # model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1))
-    # f = model.fit(train, epochs=100)
-    # e = model.evaluate(test, return_dict=True)
-    # p = model.predict(predict)
-    # print('a')
-
-    # data = pd.read_csv('../data sets/good_reads_gendered.csv')
-    #
-    # # TODO determine if I want author genres, name, and title.... they add a lot of ohe features
-    # data = data.drop(['author_id', 'author_page_url', 'book_fullurl', 'author_genres', 'book_id',
-    #                   'author_name', 'book_title'], axis=1)
-    #
-    # replace_dict = {}
-    # for d in data['publish_date'].unique():
-    #     if type(d) != str and math.isnan(d):
-    #         replace_dict[d] = 0
-    #     else:
-    #         replace_dict[d] = int(d.split(' ')[-1])
-    #
-    # data['publish_date'].replace(replace_dict, inplace=True)
-    # data = oh_encode(data)
-    #
-    # train, test = train_test_split(data, test_size=0.2)
-    # train_y = train.pop('score')
-    # test_y = test.pop('score')
-    #
-    # # Learn multiple dense layers.
-    # model = tf.keras.Sequential([
-    #         tf.keras.layers.Dense(64, activation="relu", input_shape=(data.shape[1] - 1,)),
-    #         # tf.keras.layers.Dense(64, activation="relu"),
-    #         tf.keras.layers.Dense(1)  # Make rating predictions in the final layer.
-    # ])
-    # model.compile(
-    #     optimizer=tf.keras.optimizers.Adam(learning_rate=0.1),
-    #     loss=tf.keras.losses.MeanSquaredError(),
-    #     metrics=[tf.keras.metrics.RootMeanSquaredError()]
-    # )
-    #
-    # data.pop('score')
-    # f = model.fit(train, train_y, epochs=50)
-    # e = model.evaluate(test, test_y, return_dict=True)
-    # p = model.predict(data)
-    # print('a')
-
-    # Ratings data.
-    ratings = tfds.load('movielens/100k-ratings', split="train")
-    # Features of all the available movies.
-    movies = tfds.load('movielens/100k-movies', split="train")
-
-    # Select the basic features.
-    ratings = ratings.map(lambda x: {
-        "movie_title": x["movie_title"],
-        "user_id": x["user_id"],
-        "user_rating": x["user_rating"]
-    })
-
-    movies = movies.map(lambda x: x["movie_title"])
-    users = ratings.map(lambda x: x["user_id"])
-
-    user_ids_vocabulary = tf.keras.layers.experimental.preprocessing.StringLookup(mask_token=None)
-    user_ids_vocabulary.adapt(users.batch(1000))
-
-    movie_titles_vocabulary = tf.keras.layers.experimental.preprocessing.StringLookup(mask_token=None)
-    movie_titles_vocabulary.adapt(movies.batch(1000))
-
-    key_func = lambda x: user_ids_vocabulary(x["user_id"])
-    reduce_func = lambda key, dataset: dataset.batch(100)
-    ds_train = ratings.group_by_window(key_func=key_func, reduce_func=reduce_func, window_size=100)
-
-    for x in ds_train.take(1):
-        for key, value in x.items():
-            print(f"Shape of {key}: {value.shape}")
-            print(f"Example values of {key}: {value[:5].numpy()}")
-            print()
-
-    def _features_and_labels(
-            x: Dict[str, tf.Tensor]) -> Tuple[Dict[str, tf.Tensor], tf.Tensor]:
-        labels = x.pop("user_rating")
-        return x, labels
-
-    ds_train = ds_train.map(_features_and_labels)
-
-    ds_train = ds_train.apply(tf.data.experimental.dense_to_ragged_batch(batch_size=32))
-
-    for x, label in ds_train.take(1):
-        for key, value in x.items():
-            print(f"Shape of {key}: {value.shape}")
-            print(f"Example values of {key}: {value[:3, :3].numpy()}")
-            print()
-        print(f"Shape of label: {label.shape}")
-        print(f"Example values of label: {label[:3, :3].numpy()}")
-
-    class MovieLensRankingModel(tf.keras.Model):
-
-        def __init__(self, user_vocab, movie_vocab):
-            super().__init__()
-
-            # Set up user and movie vocabulary and embedding.
-            self.user_vocab = user_vocab
-            self.movie_vocab = movie_vocab
-            self.user_embed = tf.keras.layers.Embedding(user_vocab.vocabulary_size(), 64)
-            self.movie_embed = tf.keras.layers.Embedding(movie_vocab.vocabulary_size(), 64)
-
-        def call(self, features: Dict[str, tf.Tensor]) -> tf.Tensor:
-            # Define how the ranking scores are computed:
-            # Take the dot-product of the user embeddings with the movie embeddings.
-
-            user_embeddings = self.user_embed(self.user_vocab(features["user_id"]))
-            movie_embeddings = self.movie_embed(self.movie_vocab(features["movie_title"]))
-
-            return tf.reduce_sum(user_embeddings * movie_embeddings, axis=2)
-
-    # Create the ranking model, trained with a ranking loss and evaluated with
-    # ranking metrics.
-    model = MovieLensRankingModel(user_ids_vocabulary, movie_titles_vocabulary)
-    optimizer = tf.keras.optimizers.Adagrad(0.5)
-    loss = tfr.keras.losses.get(
-        loss=tfr.keras.losses.RankingLossKey.SOFTMAX_LOSS, ragged=True)
-    eval_metrics = [
-        tfr.keras.metrics.get(key="ndcg", name="metric/ndcg", ragged=True),
-        tfr.keras.metrics.get(key="mrr", name="metric/mrr", ragged=True)
-    ]
-    model.compile(optimizer=optimizer, loss=loss, metrics=eval_metrics)
-    model.fit(ds_train, epochs=3)
-
-    # Get movie title candidate list.
-    for movie_titles in movies.batch(2000):
-        break
-
-    # Generate the input for user 42.
-    inputs = {
-        "user_id": tf.expand_dims(tf.repeat("42", repeats=movie_titles.shape[0]), axis=0),
-        "movie_title": tf.expand_dims(movie_titles, axis=0)
-    }
-
-    # Get movie recommendations for user 42.
-    scores = model(inputs)
-    titles = tfr.utils.sort_by_scores(scores, [tf.expand_dims(movie_titles, axis=0)])[0]
-    print(f"Top 5 recommendations for user 42: {titles[0, :5]}")
-
-
-class BookRanker(tf.keras.Model):
-    def __init__(self, df_data, features, key_name, label_name):
-        super().__init__()
-        self.__label_name = label_name
-        self.__features = features
-
-        # Convert Pandas Dataframe into a mapped Tensorflow Dataset, so we can access features like a dictionary
-        feats_with_label = features.copy()
-        feats_with_label.append(label_name)
-        self.__mapped_feats = tf.data.Dataset.from_tensor_slices(dict(df_data)).map(lambda x: {
-            feat: x[feat] for feat in feats_with_label
-        })
-
-        # TODO will I need to generate a vocabulary for the validation data too (data with birthplace and gender)? Yes.
-        self.__unique_tensors = {}  # Create dict of tensors, 1 per feature containing the unique values of each feature
-        self.__mapped_unique_tensors = {}  # Map unique values. Used for adapting vocab to a batch.
-        self.__feat_tensors = {}  # Create a dict of tensors, 1 per feature containing all the data for that feature
-        self.__feat_vocab = {}  # Create dict of feature vocabularies used for embeddings
-        self.__feat_embed = {}  # Create dict of feature embeddings
-        for feat in features:
-            self.__unique_tensors[feat] = tf.data.Dataset.from_tensor_slices({feat: df_data[feat].unique()})
-            self.__mapped_unique_tensors[feat] = self.__unique_tensors[feat].map(lambda x: x[feat])
-            self.__feat_tensors[feat] = tf.data.Dataset.from_tensor_slices({feat: df_data[feat]})
-
-            # TODO only do strings for now. Need to find out how to do with numeric features.
-            if df_data[feat].dtype == 'object':
-                self.__feat_vocab[feat] = tf.keras.layers.experimental.preprocessing.StringLookup(mask_token=None)
-                self.__feat_vocab[feat].adapt(self.__mapped_unique_tensors[feat].batch(1000))
-                self.__feat_embed[feat] = tf.keras.layers.Embedding(self.__feat_vocab[feat].vocabulary_size(), 64)
-
-        key_func = lambda x: self.__feat_vocab[key_name](x[key_name])
-        reduce_func = lambda key, dataset: dataset.batch(100)
-        train = self.__mapped_feats.group_by_window(key_func=key_func, reduce_func=reduce_func, window_size=100)
-
-        def get_feat_and_label(d):
-            labels = d.pop('rating')
-            return d, labels
-
-        train = train.map(get_feat_and_label)
-        print(train.element_spec)
-        print('---')
-        [print(name) for name in train.element_spec[0]]
-        self.train_data = train.apply(tf.data.experimental.dense_to_ragged_batch(batch_size=32))
-
-    def call(self, features: Dict[str, tf.Tensor]) -> tf.Tensor:
-        embeddings = None
-        for feat in self.__features:
-            if feat == self.__label_name:
-                continue
-            if embeddings is None and features[feat].dtype == tf.string:
-                embeddings = self.__feat_embed[feat](self.__feat_vocab[feat](features[feat]))
-            elif features[feat].dtype == tf.string:
-                embeddings = embeddings * self.__feat_embed[feat](self.__feat_vocab[feat](features[feat]))
-
-        # TODO the problem really is multiplying and summing multiple tensors result in loss not changing.
-        #  What other operations can I do to combine all features? Multiply all features and then with user?
-        ue = self.__feat_embed['user_id'](self.__feat_vocab['user_id'](features['user_id']))
-        te = self.__feat_embed['title'](self.__feat_vocab['title'](features['title']))
-        ge = self.__feat_embed['genre'](self.__feat_vocab['author'](features['genre']))
-        return tf.reduce_sum(ue * ge, axis=2)
-
-
-def lens_test():
-    class MovieLensRankingModel(tf.keras.Model):
-        def __init__(self, user_vocab, movie_vocab):
-            super().__init__()
-
-            # Set up user and movie vocabulary and embedding.
-            self.user_vocab = user_vocab
-            self.movie_vocab = movie_vocab
-            self.user_embed = tf.keras.layers.Embedding(user_vocab.vocabulary_size(),
-                                                        64)
-            self.movie_embed = tf.keras.layers.Embedding(movie_vocab.vocabulary_size(),
-                                                         64)
-
-        def call(self, features: Dict[str, tf.Tensor]) -> tf.Tensor:
-            # Define how the ranking scores are computed:
-            # Take the dot-product of the user embeddings with the movie embeddings.
-
-            user_embeddings = self.user_embed(self.user_vocab(features["user_id"]))
-            movie_embeddings = self.movie_embed(
-                self.movie_vocab(features["title"]))
-
-            return tf.reduce_sum(user_embeddings * movie_embeddings, axis=2)
-
-    data = pd.read_csv('data/preprocessed/merged.csv')
-    book_gendered = pd.read_csv('data/preprocessed/books_sensitive.csv')
-    data['user_id'] = data['user_id'].astype(str)
-
-    # Convert data into a Dataset
-    ds = tf.data.Dataset.from_tensor_slices(dict(data))
-    ds_titles = tf.data.Dataset.from_tensor_slices({
-        'title': data['title'].unique()
-    })
-
-    # Select basic features
-    feats = ds.map(lambda x: {
-        'title': x['title'],
-        'user_id': x['user_id'],
-        'rating': x['rating']
-    })
-
-    titles = ds_titles.map(lambda x: x['title'])
-    users = feats.map(lambda x: x['user_id'])
-
-    title_vocab = tf.keras.layers.experimental.preprocessing.StringLookup(mask_token=None)
-    title_vocab.adapt(titles.batch(1000))
-
-    user_vocab = tf.keras.layers.experimental.preprocessing.StringLookup(mask_token=None)
-    user_vocab.adapt(users.batch(1000))
-
-    key_func = lambda x: user_vocab(x["user_id"])
-    reduce_func = lambda key, dataset: dataset.batch(100)
-    ds_train = feats.group_by_window(key_func=key_func, reduce_func=reduce_func, window_size=100)
-
-    def get_feat_and_label(d):
-        labels = d.pop('rating')
-        return d, labels
-
-    ds_train = ds_train.map(get_feat_and_label)
-    ds_train = ds_train.apply(tf.data.experimental.dense_to_ragged_batch(batch_size=32))
-
-    for x, label in ds_train.take(1):
-        for key, value in x.items():
-            print(f"Shape of {key}: {value.shape}")
-            print(f"Example values of {key}: {value[:3, :3].numpy()}")
-            print()
-        print(f"Shape of label: {label.shape}")
-        print(f"Example values of label: {label[:3, :3].numpy()}")
-
-    # Create the ranking model, trained with a ranking loss and evaluated with
-    # ranking metrics.
-    model = MovieLensRankingModel(user_vocab, title_vocab)
-    optimizer = tf.keras.optimizers.Adagrad(0.5)
-    loss = tfr.keras.losses.get(loss=tfr.keras.losses.RankingLossKey.SOFTMAX_LOSS, ragged=True)
-    eval_metrics = [
-        tfr.keras.metrics.get(key="ndcg", name="metric/ndcg", ragged=True),
-        tfr.keras.metrics.get(key="mrr", name="metric/mrr", ragged=True)
-    ]
-    model.compile(optimizer=optimizer, loss=loss, metrics=eval_metrics)
-    model.fit(ds_train, epochs=10)
-
-    # Get movie title candidate list.
-    for book_titles in titles.batch(2000):
-        break
-
-    # Generate the input for user 42.
-    inputs = {
-        "user_id": tf.expand_dims(tf.repeat("42", repeats=book_titles.shape[0]), axis=0),
-        "title": tf.expand_dims(book_titles, axis=0)
-    }
-
-    # Get movie recommendations for user 42.
-    scores = model(inputs)
-    titles = tfr.utils.sort_by_scores(scores, [tf.expand_dims(book_titles, axis=0)])[0]
-    print(f"Top 10 recommendations for user 42: {titles[0, :10]}")
-
-
-def my_own_ranker_test():
-    features = ['title', 'author', 'genre', 'average_rating', 'user_id',
-                'rating_count', 'review_count', 'date_published', 'pages']
-    data = pd.read_csv('data/preprocessed/merged.csv').sample(frac=1)
-    book_gendered = pd.read_csv('data/preprocessed/books_sensitive.csv')
-    data['user_id'] = data['user_id'].astype(str)
-
-    model = BookRanker(data, features, 'user_id', 'rating')
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(0.5),
-        loss=tfr.keras.losses.get(loss=tfr.keras.losses.RankingLossKey.SOFTMAX_LOSS, ragged=True),
-        metrics=[
-            tfr.keras.metrics.get(key="ndcg", name="metric/ndcg", ragged=True),
-            tfr.keras.metrics.get(key="mrr", name="metric/mrr", ragged=True)
-        ]
-    )
-    model.fit(model.train_data, epochs=20)
+from utils import preprocess_all_data, calc_individual_fairness_metrics_and_accuracy
 
 
 if __name__ == '__main__':
-    print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
-
     # preprocess_all_data()
     data = pd.read_csv('data/preprocessed/merged.csv').sample(frac=1)
-    book_gendered = pd.read_csv('data/preprocessed/books_sensitive.csv')
+    book_gendered = pd.read_csv('data/preprocessed/books_sensitive.csv').drop_duplicates(subset=['title'])
 
     # Set up data in sensitive book data
-    gendered_author = book_gendered.pop('author')
-    gendered_birthplace = book_gendered.pop('birthplace')
-    gendered_gender = book_gendered.pop('author_gender')
-    gendered_title = book_gendered.pop('title')
+    recommend_author = book_gendered.pop('author')
 
-    for user in data['user_id'].unique():
+    # Used later to compute distance metrics between recommendations
+    copied_gender_data = book_gendered.copy()
+
+    num_ratings = []
+    user_ids = []
+
+    recommend_birthplace = book_gendered.pop('birthplace')
+    recommend_gender = book_gendered.pop('author_gender')
+    recommend_title = book_gendered.pop('title')
+    gender_and_title = pd.concat([recommend_title, recommend_gender], axis=1)
+
+    old_individual_fairness_satisfaction_rates = []
+    new_individual_fairness_satisfaction_rates = []
+    replaced_worst_individual_fairness_satisfaction_rates = []
+
+    fairness_improved = []
+    fairness_improved_by = []
+
+    male_appearance_rates = []
+    female_appearance_rates = []
+    birthplace_appearance_rates = {}
+    avg_birthplace_appearance_rates = {}
+
+    old_male_scores = []
+    old_male_ranks = []
+    old_female_scores = []
+    old_female_ranks = []
+
+    new_male_scores = []
+    new_male_ranks = []
+    new_female_scores = []
+    new_female_ranks = []
+
+    replaced_male_scores = []
+    replaced_male_ranks = []
+    replaced_female_scores = []
+    replaced_female_ranks = []
+
+    # TODO final run use 50
+    users_with_x_or_more_ratings = [
+        user for user in data['user_id'].unique()
+        if len(data[data['user_id'] == user]) >= 50
+    ]
+    print(f'Learning recommendation ranker for {len(users_with_x_or_more_ratings)} users...')
+
+    for user in users_with_x_or_more_ratings:
         user_data = data[data['user_id'] == user].copy()
         user_data.drop(['user_id'], axis=1, inplace=True)
+
+        num_ratings.append(len(user_data))
+        user_ids.append(user)
 
         # Just using user_data as the training, no splitting for validation since there are so few ratings per person.
         # Just going to validate on the sensitive data.
         train_y = user_data.pop('rating')
         train_authors = user_data.pop('author')
         train_titles = user_data.pop('title')
+        data_feat_num = user_data.shape[1]
 
         model = tf.keras.models.Sequential([
-            tf.keras.layers.Dense(user_data.shape[1], activation='relu', input_shape=(user_data.shape[1],)),
-            tf.keras.layers.Dense(math.floor(user_data.shape[1] / 2)),
+            tf.keras.layers.Dense(data_feat_num, activation='relu', input_shape=(data_feat_num,)),
+            tf.keras.layers.Dense(math.floor(data_feat_num / 4)),
+            tf.keras.layers.Dense(math.floor(data_feat_num / 16), activation='relu'),
             tf.keras.layers.Dense(1)
         ])
 
         callbacks = [
-            tf.keras.callbacks.EarlyStopping(monitor='loss', patience=1000, min_delta=0.00001, baseline=4, restore_best_weights=True)
+            tf.keras.callbacks.EarlyStopping(monitor='loss', patience=600, min_delta=0.0001, restore_best_weights=True)
         ]
-        model.compile(optimizer=tf.keras.optimizers.Adagrad(learning_rate=0.0001),
-                      loss=tf.keras.losses.MeanAbsoluteError(),
-                      # metrics=[tf.keras.metrics.Accuracy()],
-                      )
+        model.compile(optimizer=tf.optimizers.Adam(learning_rate=0.001),
+                      loss=tf.keras.losses.MeanAbsoluteError())
 
-        train_hist = model.fit(user_data, train_y, callbacks=callbacks, epochs=10000)
-        h = pd.DataFrame(train_hist.history)
-        h['epoch'] = train_hist.epoch
+        # TODO final run use epoch=8000
+        train_hist = model.fit(user_data, train_y, callbacks=callbacks, epochs=8000, verbose=0)
 
-        # Get predicted values
-        train_pred = model.predict(user_data)
-        ranking_train = [(t, p[0]) for t, p in zip(train_titles, train_pred)]
-        ranking_train.sort(key=lambda x: x[1])
+        # Getting a prediction using gendered data
+        test_pred = [v[0] for v in model.predict(book_gendered)]
 
-        test_pred = model.predict(book_gendered)
-        ranking_test = [(t, p[0]) for t, p in zip(gendered_title, test_pred)]
-        ranking_test.sort(key=lambda x: x[1])
-        print(ranking_train)
-        print(ranking_test[:10])
+        # ranking_test = [(t, p, norm) for t, p, norm in zip(recommend_title, test_pred, z_scored_rank)]
+        ranking_test = [(t, g, p) for t, g, p in zip(recommend_title, recommend_gender, test_pred)]
+        ranking_test.sort(key=lambda x: x[2])
+        ranking_test = list(reversed(ranking_test))
+
+        # all_ranked, top = calc_individual_fairness_metrics_and_accuracy(ranking_test, copied_gender_data)
+        # print(all_ranked['satisfaction_rate'])
+
+        top_num = 30
+        top = calc_individual_fairness_metrics_and_accuracy(ranking_test, copied_gender_data,
+                                                            top_only=True, top=top_num)
+
+        for r in top['old_ranking']:
+            if r['gender'] == 'male':
+                old_male_ranks.append(r['rank'])
+                old_male_scores.append(r['score'])
+
+                if not top["improved"]:
+                    replaced_male_ranks.append(r['rank'])
+                    replaced_male_scores.append(r['score'])
+            if r['gender'] == 'female':
+                old_female_ranks.append(r['rank'])
+                old_female_scores.append(r['score'])
+                if not top["improved"]:
+                    replaced_female_ranks.append(r['rank'])
+                    replaced_female_scores.append(r['score'])
+
+        for r in top['new_ranking']:
+            if r['gender'] == 'male':
+                new_male_ranks.append(r['rank'])
+                new_male_scores.append(r['score'])
+                if top["improved"]:
+                    replaced_male_ranks.append(r['rank'])
+                    replaced_male_scores.append(r['score'])
+            if r['gender'] == 'female':
+                new_female_ranks.append(r['rank'])
+                new_female_scores.append(r['score'])
+                if top["improved"]:
+                    replaced_female_ranks.append(r['rank'])
+                    replaced_female_scores.append(r['score'])
+
+        print(top['old_satisfaction_rate'])
+        print(top['new_satisfaction_rate'])
+        print(f'Improved? {top["improved"]}')
+        print(f'Printing top 10 of {top_num} new ranked:')
+        print(top['new_ranking'][:10])
+        print()
+
+        old_individual_fairness_satisfaction_rates.append(top['old_satisfaction_rate'])
+        new_individual_fairness_satisfaction_rates.append(top['new_satisfaction_rate'])
+        replaced_worst_individual_fairness_satisfaction_rates.append(
+            top['new_satisfaction_rate'] if top["improved"] else top['old_satisfaction_rate']
+        )
+        fairness_improved.append(top['improved'])
+        fairness_improved_by.append(top['new_satisfaction_rate'] - top['old_satisfaction_rate']
+                                    if top['improved'] else 0)
+
+        male_appearance_rates.append(top['male'])
+        female_appearance_rates.append(top['female'])
+
+        for b in top['birthplace'].keys():
+            if b not in birthplace_appearance_rates:
+                birthplace_appearance_rates[b] = []
+            birthplace_appearance_rates[b].append(top['birthplace'][b])
+
+        # # Get predicted ranking for training data. Not really used in project but interesting to see.
+        # train_pred = model.predict(user_data)
+        # ranking_train = [(t, y, p[0]) for t, y, p in zip(train_titles, train_y, train_pred)]
+        # ranking_train.sort(key=lambda x: x[2])
+        # ranking_train = list(reversed(ranking_train))
+        # print('\nPrinting ranking of training data:')
+        # print(ranking_train)
+        # print()
+
+    num_results = len(old_individual_fairness_satisfaction_rates)
+    old_avg_individual_fairness_satisfaction_rate = np.average(old_individual_fairness_satisfaction_rates)
+    new_avg_individual_fairness_satisfaction_rate = np.average(new_individual_fairness_satisfaction_rates)
+    replaced_worst_avg_individual_fairness_satisfaction_rate = np.average(
+        replaced_worst_individual_fairness_satisfaction_rates
+    )
+    avg_female_appearance_rate = np.average(female_appearance_rates)
+    avg_male_appearance_rate = np.average(male_appearance_rates)
+    fair_filtered = list(filter(lambda x: x != 0, fairness_improved_by))
+    avg_improved_by = np.average(fair_filtered)
+
+    avg_old_male_scores = np.average(old_male_scores)
+    avg_old_male_ranks = np.average(old_male_ranks)
+    avg_old_female_scores = np.average(old_female_scores)
+    avg_old_female_ranks = np.average(old_female_ranks)
+
+    avg_new_male_scores = np.average(new_male_scores)
+    avg_new_male_ranks = np.average(new_male_ranks)
+    avg_new_female_scores = np.average(new_female_scores)
+    avg_new_female_ranks = np.average(new_female_ranks)
+
+    avg_replaced_male_scores = np.average(replaced_male_scores)
+    avg_replaced_male_ranks = np.average(replaced_male_ranks)
+    avg_replaced_female_scores = np.average(replaced_female_scores)
+    avg_replaced_female_ranks = np.average(replaced_female_ranks)
+
+    did_improve_num = fairness_improved.count(True)
+    fairness_improved_rate = did_improve_num / len(fairness_improved)
+    test_fair_improve_rate = np.average(did_improve_num)
+
+    for b in birthplace_appearance_rates.keys():
+        if b not in avg_birthplace_appearance_rates:
+            avg_birthplace_appearance_rates[b] = []
+        avg_birthplace_appearance_rates[b] = [np.average(birthplace_appearance_rates[b])if i == 0 else 0
+                                              for i in range(len(old_individual_fairness_satisfaction_rates))]
+
+    pd.DataFrame({
+        'user_id': user_ids,
+        'number_of_ratings': num_ratings,
+        'old_indiv_satisfaction_rate': old_individual_fairness_satisfaction_rates,
+        'old_avg_indv_satisfaction_rate': [old_avg_individual_fairness_satisfaction_rate
+                                           if i == 0 else 0
+                                           for i in range(num_results)],
+        'new_indiv_satisfaction_rate': new_individual_fairness_satisfaction_rates,
+        'new_avg_indv_satisfaction_rate': [new_avg_individual_fairness_satisfaction_rate
+                                           if i == 0 else 0
+                                           for i in range(num_results)],
+        'replaced_worst_avg_individual_fairness_satisfaction_rate': [
+            replaced_worst_avg_individual_fairness_satisfaction_rate
+            if i == 0 else 0
+            for i in range(num_results)
+        ],
+        'did_fairness_improve': fairness_improved,
+        'fairness_improved_rate': [fairness_improved_rate if i == 0 else 0 for i in range(num_results)],
+        'improved_by': fairness_improved_by,
+        'avg_improved_by': [avg_improved_by if i == 0 else 0 for i in range(num_results)],
+        'male_appearance_rates': male_appearance_rates,
+        'avg_male_appearance_rate': [avg_male_appearance_rate if i == 0 else 0 for i in range(num_results)],
+        'female_appearance_rates': female_appearance_rates,
+        'avg_female_appearance_rates': [avg_female_appearance_rate if i == 0 else 0 for i in range(num_results)],
+        'avg_old_male_scores': [avg_old_male_scores if i == 0 else 0 for i in range(num_results)],
+        'avg_old_male_ranks': [avg_old_male_ranks if i == 0 else 0 for i in range(num_results)],
+        'avg_old_female_scores': [avg_old_female_scores if i == 0 else 0 for i in range(num_results)],
+        'avg_old_female_ranks': [avg_old_female_ranks if i == 0 else 0 for i in range(num_results)],
+        'avg_new_male_scores': [avg_new_male_scores if i == 0 else 0 for i in range(num_results)],
+        'avg_new_male_ranks': [avg_new_male_ranks if i == 0 else 0 for i in range(num_results)],
+        'avg_new_female_scores': [avg_new_female_scores if i == 0 else 0 for i in range(num_results)],
+        'avg_new_female_ranks': [avg_new_female_ranks if i == 0 else 0 for i in range(num_results)],
+        'avg_replaced_male_scores': [avg_replaced_male_scores if i == 0 else 0 for i in range(num_results)],
+        'avg_replaced_male_ranks': [avg_replaced_male_ranks if i == 0 else 0 for i in range(num_results)],
+        'avg_replaced_female_scores': [avg_replaced_female_scores if i == 0 else 0 for i in range(num_results)],
+        'avg_replaced_female_ranks': [avg_replaced_female_ranks if i == 0 else 0 for i in range(num_results)],
+        **avg_birthplace_appearance_rates
+    }).to_csv('data/fairness_out.csv', index=False)
 
     # print(train_hist.history['loss'])
     # plt.plot(train_hist.history['loss'], label='loss')
